@@ -1,0 +1,26 @@
+# 의존성
+node_modules/
+
+# 빌드 결과물
+dist/
+dist_electron/
+dist_portable/
+
+# 로그 파일
+electron_log.txt
+*.log
+
+# Vite 임시 파일
+*.timestamp-*
+
+# OS 파일
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# 기타
+.vercel
+package-lock.json

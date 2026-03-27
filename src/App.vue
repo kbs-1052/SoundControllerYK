@@ -292,6 +292,7 @@
       <div class="diag-item">
         <span class="diag-label">🕒 현재 시간</span>
         <span class="diag-value">{{ formatTime(new Date().getHours(), new Date().getMinutes()) }}:{{ String(new Date().getSeconds()).padStart(2,'0') }} ({{ todayString }})</span>
+        <button class="btn-micro" @click="clearDismissed" title="닫기 기록 초기화">🔄 초기화</button>
       </div>
       <div class="diag-item">
         <span class="diag-label">🔄 스케줄러</span>
@@ -563,10 +564,15 @@ onMounted(() => {
 
 const activateSystem = () => {
   isSystemActive.value = true
+  clearDismissed() // 시스템 시작 시 모든 '닫기' 기록 초기화하여 예약 누락 방지
   addLog("시스템이 활성화되었습니다.")
-  // 더미 사운드 재생으로 오디오 컨텍스트 깨우기
   const audio = new Audio();
   audio.play().catch(() => {});
+}
+
+const clearDismissed = () => {
+  dismissedIds.value.clear()
+  addLog("닫기 기록이 초기화되었습니다.")
 }
 
 // webview가 로드 완료되었을 때 호출되는 콜백 (볼륨 조절 등)
@@ -673,12 +679,12 @@ const updateScheduler = async () => {
       continue
     }
 
-    // 요일 체크: 모든 공백을 제거하고 부분 일치를 허용하여 매칭률 상향 (배포 환경 호환성)
+    // 요일 체크: 글자 포함 여부(금 vs 금요일)와 공백 제거를 동시에 수행 (강력한 매칭)
     const normalizedToday = today.trim();
     const isTodayScheduled = res.playDays && (
-      res.playDays.toString().includes(normalizedToday) || 
-      normalizedToday.includes(res.playDays.toString()) ||
-      (Array.isArray(res.playDays) && res.playDays.some(d => d.toString().trim().includes(normalizedToday) || normalizedToday.includes(d.toString().trim())))
+      res.playDays.toString().replace(/\s/g, '').includes(normalizedToday) || 
+      normalizedToday.includes(res.playDays.toString().replace(/\s/g, '')) ||
+      (Array.isArray(res.playDays) && res.playDays.some(d => d.toString().includes(normalizedToday) || normalizedToday.includes(d.toString())))
     )
 
     let skipReason = ""
@@ -691,20 +697,35 @@ const updateScheduler = async () => {
       }
     }
 
+    const ridStr = res.id.toString()
+    
+    // 예약 상세 정보 로깅 (디버그용: 요일과 시간 범위가 모두 O인데도 후보군에 안 들어가는 경우 대비)
+    if (now.getSeconds() === 0 && !isTodayScheduled) {
+       console.log(`[Debug] Reservation ID:${res.id} skipped - Day Mismatch`);
+    }
+
     if (isTodayScheduled) {
       const startScore = Number(res.startHour) * 60 + Number(res.startMinute)
       const endScore = Number(res.endHour) * 60 + Number(res.endMinute)
 
       if (nowScore >= startScore && nowScore < endScore) {
-        if (!dismissedIds.value.has(rid)) {
+        // 이미 명시적으로 닫은(dismissed) 예약인지 확인 (자료형 무관하게 체크)
+        const isDismissed = Array.from(dismissedIds.value).some(id => id.toString() === ridStr);
+        
+        if (!isDismissed) {
           res.status = '플레이중'
           const type = (res.mediaContent.includes('youtube.com') || res.mediaContent.includes('youtu.be')) ? 'youtube' : 'audio'
-          candidates.push({ rid, res, type, priority: type === 'audio' ? 2 : 1 })
+          candidates.push({ rid: res.id, res, type, priority: type === 'audio' ? 2 : 1 })
         } else {
           res.status = '완료'
         }
       } else {
-        if (nowScore >= endScore) res.status = '완료'
+        // 예약 시간이 지나면 dismissed 목록에서 제거하여 다음 날 다시 재생될 수 있게 함
+        if (nowScore >= endScore) {
+           dismissedIds.value.delete(res.id);
+           dismissedIds.value.delete(Number(res.id));
+           res.status = '완료'
+        }
         else res.status = '대기'
       }
     }
@@ -733,12 +754,16 @@ const updateScheduler = async () => {
 
     // 현재 재생 중인 미디어와 다른 경우에만 처리
     // 단, 유튜브 중단 상태(isAudioInterrupted)에서 오디오 예약이 들어온 경우에도 처리
-    const isNewMedia = !activeMedia.value || activeMedia.value.id !== rid
-    const isYTInterruptedByAudio = isAudioInterrupted.value && activeMedia.value?.type === 'audio' && type === 'audio' && activeMedia.value?.id === rid
+    const isNewMedia = !activeMedia.value || activeMedia.value.id.toString() !== rid.toString()
+    const isYTInterruptedByAudio = isAudioInterrupted.value && activeMedia.value?.type === 'audio' && type === 'audio' && activeMedia.value?.id.toString() === rid.toString()
 
-    if (isNewMedia && !isYTInterruptedByAudio) {
+    // --- 중요: 이미 미디어가 설정되어 있어도 플레이어가 아직 안 떴거나 초기화 중이면 다시 시도 가능하게 함 ---
+    const isYTNotRunning = type === 'youtube' && !isYTLoaded.value;
+    const isAudioNotRunning = type === 'audio' && (!audioPlayer.value || audioPlayer.value.paused);
+
+    if (isNewMedia || isYTNotRunning || (isAudioNotRunning && type === 'audio')) {
       // 유튜브 재생 중에 오디오 예약이 시작된 경우: 유튜브 상태 저장 후 중단
-      if (activeMedia.value?.type === 'youtube' && type === 'audio') {
+      if (activeMedia.value?.type === 'youtube' && type === 'audio' && !isYTInterruptedByAudio) {
         isAudioInterrupted.value = true
         interruptedYTMedia.value = { ...activeMedia.value }
         
@@ -855,8 +880,17 @@ const updateScheduler = async () => {
       
       // 첫 번째 예약의 정보를 짧게 노출하여 확인 유도
       if (resCount > 0) {
-        const summaries = reservations.value.map(r => `${r.playDays} ${r.startHour}:${r.startMinute}~${r.endHour}:${r.endMinute}`).join(' | ');
-        msg += ` | 검토내역: ${summaries}`;
+        const first = reservations.value[0];
+        const dayMatch = (first.playDays && first.playDays.toString().includes(today)) ? 'O' : 'X';
+        const startSec = Number(first.startHour) * 60 + Number(first.startMinute);
+        const endSec = Number(first.endHour) * 60 + Number(first.endMinute);
+        const timeMatch = (nowScore >= startSec && nowScore < endSec) ? 'O' : 'X';
+        
+        // 차단 여부 체크
+        const isBlocked = Array.from(dismissedIds.value).some(id => id.toString() === first.id.toString());
+        const blockStatus = isBlocked ? '[현재 차단됨]' : '';
+        
+        msg += ` | ${blockStatus} [요일:${dayMatch}, 시간:${timeMatch}] ${first.playDays} ${first.startHour}:${first.startMinute}~${first.endHour}:${first.endMinute}`;
       }
       
       addLog(msg);
@@ -1203,4 +1237,14 @@ onUnmounted(() => {
 }
 .activation-content h2 { color: #fff; margin-bottom: 10px; }
 .activation-content p { color: #aaa; margin-bottom: 25px; }
+.btn-micro {
+  background: #333;
+  color: #aaa;
+  border: 1px solid #444;
+  font-size: 0.6rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.btn-micro:hover { background: #444; color: #fff; }
 </style>
